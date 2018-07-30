@@ -1,0 +1,176 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Tung Hoang"
+output:
+  html_document: default
+  html_notebook: default
+  pdf_document: default
+---
+
+### Summary
+
+In this project, we are going to use the recorded activity data given in 'pml-training.csv' file to build a model predicting 5 different ways of performing barbell lifts. Details about the original data set can be found on this website: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+In this multi-class classification problem, Support Vector Machines with Radial Kernel algorithm (caret package) was used to predict the excercise data. The data was divided into train, validate and test sets. The final model has very high out-of-the-bag accuracy rate (0.99)
+
+### Data Cleaning
+
+First we load the data and get some understanding of its structure.
+
+```{r}
+pml <- read.csv('pml-training.csv', na.strings = c('','NA'))
+dim(pml)
+```
+
+The initial impression is that the data has a large number of features (160). The predicted value is the last column 'classe'.  However, not all variables are relevant, for example, index, user name, time stamp etc. Also, we will need to perform some feature selection technique to select the variables for the prediction model.
+
+Some variables contains blank or null values so we first eliminate these columns and also the first 7 columns.
+Now the dataset includes the predicted value and 52 numerical variables
+```{r}
+pml <- pml[,c(8:ncol(pml))]
+pml <- pml[,colSums(is.na(pml))==0]
+dim(pml)
+```
+
+### Train, Validate & Test Set
+
+As the dataset is quiet large, using k-fold validation will take a lot of time to train a model.
+We divide the dataset into train, validate and test set with the proportion of 0.7, 0.15 and 0.15 respectively.
+
+```{r}
+set.seed(1991)
+train_validate_test <- sample(1:3, nrow(pml), replace = TRUE, prob = c(0.7,0.15,0.15))
+
+train <- pml[train_validate_test==1,]
+validate <- pml[train_validate_test==2,]
+test <- pml[train_validate_test==3,]
+```
+
+### Support Vector Machines with Radial Basis Function Kernel
+I chose SVM for this prediction model because it is said to be effective with high dimensional data and also memory efficient, i.e. faster to train with my computer than Random Forest/ensemble methods.
+
+We will use the SVM with Radial Kernel training function provided in the 'caret' pakage.
+
+Note that the code below creates the option to do parallel processing with caret, improving the computing time.
+
+```{r warning=FALSE}
+library(doParallel)
+
+cores_2_use <- detectCores()
+cl <- makeCluster(cores_2_use, useXDR = F)
+clusterSetRNGStream(cl, 9956)
+registerDoParallel(cl, cores_2_use)
+```
+
+First, we run a simple SVM model on the training set with the default options without tuning any parameter and no resampling.
+In this case, the default kernel type is radial, cost = 1 and gamma = 1.
+
+```{r cache=TRUE, warning=FALSE}
+library(caret)
+
+# Train the 1st model
+svm.model1 <- train(classe~., data = train, 
+                    method = 'svmRadial', 
+                    trControl = trainControl(method = 'none'),
+                    allowParallel = TRUE)
+
+# Predict the validate set
+svm.validate.pred1 <- predict(svm.model1, newdata=validate)
+
+# Model performance
+confusion.matrix1 <- confusionMatrix(data = svm.validate.pred1, reference = validate$classe)
+confusion.matrix1
+```
+
+The accuracy rate of the SVM model on the validate test is relatively high (86.44%).
+Also the Kappa value is pretty close to 1, which is fairly good (0.83).
+
+If we look at the frequency of correctly predicted instants in the confusion matrix below, we see that the model predict correctly almost all class A and class C.
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+
+# Calculate the frequency from the confusion matrix
+confusion.matrix.pct1 <- as.data.frame(confusion.matrix1$table/colSums(confusion.matrix1$table))
+
+# Plot the heat map
+ggplot(confusion.matrix.pct1, aes(Prediction, forcats::fct_rev(Reference), fill=Freq)) + 
+  geom_tile() + 
+  scale_fill_gradient(low = 'white', high = 'royalblue') + 
+  geom_text(aes(label=round(Freq, digits = 2))) + 
+  labs(title = 'Normalized Confusion Matrix - SVM Radial with default option',
+       x = 'Predicted Class',
+       y = 'Actual Class')
+```
+
+### Model Tuning
+
+Even though the first simple run of SVM model with radial kernel has quite a good result, we can try to tune the SVM algorithm to see if we can effectively improves the model performance. To be simple, we will choose the radial kernel and the other two parameters that we will tune the SVM include its cost and sigma. 
+- Cost is the cost of constraints violation, i.e. the 'C' constant of the regulation term om the Lagrange formulation.
+- Sigma is the parametter needed for the radial kernel.
+
+Detailed mathematical explanations: https://en.wikipedia.org/wiki/Support_vector_machine
+
+The train function from the package 'caret' will search for the best cost and sigma parameters provided in the tuneGrid.
+We will limit the range of sigma within (0.01, 0.1) and Cost within (0.1, 1 , 10)
+
+```{r cache=TRUE}
+svm.grid <- expand.grid(sigma = 10^(-2:-1),C=10^(-1:1))
+
+set.seed(1991)
+# The train control method is 5-fold cross validation
+fitControl <- trainControl(method = 'cv', number = 5)
+
+# Fit the model and searching for the best parameters
+svm.model2 <- train(classe~., data = train, method = 'svmRadial', 
+                    trControl = fitControl,
+                    tuneGrid = svm.grid,
+                    allowParallel = TRUE)
+svm.model2
+```
+
+### Final model 
+
+The tuning process identify sigma = 0.1 and C = 10 as the optimal parameters for SVM with radial kernal.
+We will fit the model with these parameters with the remaining test set and estimate the out of the bag error rates.
+
+```{r cachedChunk, cache=TRUE}
+svm.model3 <- train(classe~., data = train, method = 'svmRadial', 
+                    trControl = trainControl(method = 'none'),
+                    tuneGrid = data.frame(sigma = 0.1, C = 10)
+                    )
+
+svm.test.pred <- predict(svm.model3, newdata = test)
+
+confusion.matrix3 <- confusionMatrix(data = svm.test.pred, reference = test$classe)
+confusion.matrix3
+```
+
+The expected error rate of the test set is very high. We can clearly see a significant improvement in the performance of SVM, from accuracy of 0.86 to 0.99. All classes are almost correctly classified.
+
+```{r}
+# Calculate the frequency from the confusion matrix
+confusion.matrix.pct3 <- as.data.frame(confusion.matrix3$table/colSums(confusion.matrix3$table))
+
+# Plot the heat map
+ggplot(confusion.matrix.pct3, aes(Prediction, forcats::fct_rev(Reference), fill=Freq)) + 
+  geom_tile() + 
+  scale_fill_gradient(low = 'cornsilk', high = 'firebrick') + 
+  geom_text(aes(label=round(Freq, digits = 2))) +
+  labs(title = 'Normalized Confusion Matrix (Test Set) - SVM Radial with tuned parameters',
+       x = 'Predicted Class',
+       y = 'Actual Class')
+```
+
+### 2nd part of the project - Predicting the test set
+
+The final part of the project is fairly simple. We use the final model on the provided test data to predict new 20 cases and answer the quiz. The result is 100% correct.
+
+```{r}
+pml.test <- read.csv('pml-testing.csv')
+
+pml.test.pred <- predict(svm.model3, newdata = pml.test)
+
+pml.test.pred
+```
+
